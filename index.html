@@ -44,7 +44,7 @@
     .line-info   { color: #8b949e; white-space: pre-wrap; font-style: italic; }
     .input-row { display: flex; align-items: center; margin-top: 2px; }
     #cmd-input { flex: 1; background: transparent; border: none; outline: none; color: #e6edf3; font-family: 'Courier New', monospace; font-size: 14px; caret-color: #3fb950; }
-    #prompt-label { white-space: pre; color: #3fb950; }
+    #prompt-label { white-space: pre; color: #3fb950; flex-shrink: 0; }
     .status-bar { background: #161b22; border-top: 1px solid #30363d; padding: 3px 20px; font-size: 11px; color: #484f58; display: flex; justify-content: space-between; flex-shrink: 0; }
     #boot-overlay { position: fixed; inset: 0; background: #0d1117; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px; z-index: 99; }
     #boot-overlay p { color: #3fb950; font-size: 14px; }
@@ -53,7 +53,6 @@
   </style>
 </head>
 <body>
-
 <div id="boot-overlay"><div class="spinner"></div><p id="boot-msg">Booting Linux Lab...</p></div>
 
 <div id="login-screen">
@@ -100,27 +99,31 @@
 import { WebContainer } from 'https://esm.sh/@webcontainer/api@1.3.0';
 
 // ── globals ────────────────────────────────────────────────────────────────
-let wc, username, shellProcess, shellWriter;
+let wc, username;
+let shellCwd = '/';      // JS-tracked cwd (real WC absolute path)
+let homeDir  = '/';      // user's home in WC
 let cmdHistory = [], histIdx = -1;
-let displayCwd = '~';
-const STORAGE_KEY = u => 'llv5_' + u;
+let busy = false;
+const SKEY = u => 'llv6_' + u;
 
 // ── dom ────────────────────────────────────────────────────────────────────
-const bootOverlay = document.getElementById('boot-overlay');
-const bootMsg     = document.getElementById('boot-msg');
-const loginScreen = document.getElementById('login-screen');
-const termScreen  = document.getElementById('terminal-screen');
-const output      = document.getElementById('output');
-const cmdInput    = document.getElementById('cmd-input');
-const promptLabel = document.getElementById('prompt-label');
-const statusLeft  = document.getElementById('status-left');
-const statusRight = document.getElementById('status-right');
+const $ = id => document.getElementById(id);
+const bootOverlay  = $('boot-overlay');
+const bootMsg      = $('boot-msg');
+const loginScreen  = $('login-screen');
+const termScreen   = $('terminal-screen');
+const output       = $('output');
+const cmdInput     = $('cmd-input');
+const promptLabel  = $('prompt-label');
+const statusLeft   = $('status-left');
+const statusRight  = $('status-right');
 
-// ── output helpers ─────────────────────────────────────────────────────────
-function appendLine(text, cls = 'line-out') {
+// ── output ─────────────────────────────────────────────────────────────────
+function print(text, cls = 'line-out') {
   const row = output.querySelector('.input-row');
   const d = document.createElement('div');
-  d.className = cls; d.textContent = text;
+  d.className = cls;
+  d.textContent = text;
   output.insertBefore(d, row);
   output.scrollTop = output.scrollHeight;
 }
@@ -129,141 +132,123 @@ function clearOutput() {
   [...output.children].forEach(c => { if (c !== row) c.remove(); });
 }
 
+// ── prompt ─────────────────────────────────────────────────────────────────
+function setPrompt(absCwd) {
+  shellCwd = absCwd;
+  let display = absCwd;
+  if (absCwd === homeDir) display = '~';
+  else if (absCwd.startsWith(homeDir + '/')) display = '~/' + absCwd.slice(homeDir.length + 1);
+  promptLabel.textContent = `${username}@linux-lab:${display}$ `;
+  statusLeft.textContent = display;
+}
+
+// ── spawn helper: run one command, return {stdout, exit} ──────────────────
+async function spawnCapture(args, cwd) {
+  const proc = await wc.spawn(args[0], args.slice(1), { cwd });
+  let out = '';
+  await proc.output.pipeTo(new WritableStream({ write(c) { out += c; } }));
+  const code = await proc.exit;
+  return { out: out.trim(), code };
+}
+
+// ── run one command via sh, streaming output ───────────────────────────────
+async function spawnStream(cmd, cwd) {
+  // Use 'sh' with -c. cwd option is supported in WC >= 1.2
+  const proc = await wc.spawn('sh', ['-c', cmd], { cwd });
+  let buf = '';
+  const ws = new WritableStream({
+    write(chunk) {
+      buf += chunk;
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      lines.forEach(l => print(l));
+      output.scrollTop = output.scrollHeight;
+    }
+  });
+  proc.output.pipeTo(ws);
+  const code = await proc.exit;
+  if (buf) print(buf);
+  return code;
+}
+
+// ── path helpers ───────────────────────────────────────────────────────────
+function normPath(p) {
+  const segs = p.split('/').filter(Boolean);
+  const out = [];
+  for (const s of segs) {
+    if (s === '..') out.pop();
+    else if (s !== '.') out.push(s);
+  }
+  return '/' + out.join('/');
+}
+
+function resolveCd(arg) {
+  if (!arg || arg === '~') return homeDir;
+  if (arg.startsWith('~/')) return normPath(homeDir + '/' + arg.slice(2));
+  if (arg.startsWith('/')) return normPath(arg);
+  return normPath(shellCwd + '/' + arg);
+}
+
 // ── boot ───────────────────────────────────────────────────────────────────
 async function boot() {
   try {
     wc = await WebContainer.boot();
+    // Discover WC's real root by running pwd
+    const { out } = await spawnCapture(['sh', '-c', 'pwd'], '/');
+    // 'out' will be the real root e.g. /home/randomhash
+    // We'll use this as base for all our paths
+    window._wcActualRoot = out || '/';
     bootOverlay.style.display = 'none';
     loginScreen.style.display = 'flex';
-    document.getElementById('uname').focus();
+    $('uname').focus();
   } catch(e) {
     bootMsg.textContent = 'Boot failed: ' + e.message;
     bootMsg.style.color = '#f85149';
   }
 }
 
-// ── start a PERSISTENT shell process ──────────────────────────────────────
-// Key insight: spawn ONE long-running `sh` process and keep writing to its
-// stdin. This way `cd` persists across commands — exactly like a real terminal.
-async function startShell(homePath) {
-  // Write a tiny prompt-reporting wrapper script
-  await wc.fs.writeFile('/.prompt.sh', `
-#!/bin/sh
-# Runs as the interactive shell: reads commands, prints output + sentinel
-export HOME="${homePath}"
-export USER="${username}"
-export HOSTNAME="linux-lab"
-cd "$HOME"
-while true; do
-  CWD=$(pwd)
-  printf "\\x00PWD:$CWD\\x00"
-  read -r line
-  case "$line" in
-    exit|logout) printf "\\x00EXIT\\x00"; break ;;
-    '') ;;
-    *) eval "$line" 2>&1 ;;
-  esac
-done
-`);
+// ── setup user filesystem ──────────────────────────────────────────────────
+async function setupHome(user) {
+  // Build home path on top of WC's actual root
+  const root = window._wcActualRoot;
+  // Create home at <wcroot>/home/<user>
+  // We use wc.fs.mkdir with the path relative to WC root
+  // But WC paths in fs API are relative to WC's own root, so just use /home/user
+  // and accept that internally it maps to wcroot/home/user
+  const h = '/home/' + user;
 
-  shellProcess = await wc.spawn('sh', ['/.prompt.sh']);
-  const encoder = new TextEncoder();
+  await wc.fs.mkdir('/home', { recursive: true }).catch(() => {});
+  await wc.fs.mkdir(h, { recursive: true }).catch(() => {});
+  await wc.fs.mkdir(h + '/examples', { recursive: true }).catch(() => {});
 
-  // Writer to shell stdin
-  const stdinStream = new WritableStream({ write(chunk) {} });
-  // We need a real writable — use TransformStream trick
-  const { writable, readable } = new TransformStream();
-  shellWriter = writable.getWriter();
-  // Pipe readable → shell stdin
-  readable.pipeTo(shellProcess.input);
+  // Verify the directory is actually accessible by spawning in it
+  const check = await spawnCapture(['sh', '-c', 'pwd'], h).catch(() => null);
 
-  // ── Read shell output ──────────────────────────────────────────────────
-  // We split on sentinel \x00PWD:...\x00 to know when a command finishes
-  // and what the new cwd is.
-  let outputBuf = '';
-
-  shellProcess.output.pipeTo(new WritableStream({
-    write(chunk) {
-      outputBuf += chunk;
-      // Process all complete sentinels
-      let idx;
-      while ((idx = outputBuf.indexOf('\x00')) !== -1) {
-        const before = outputBuf.slice(0, idx);
-        outputBuf = outputBuf.slice(idx + 1);
-
-        if (before) {
-          // Print regular output lines
-          before.split('\n').forEach((l, i, arr) => {
-            if (i < arr.length - 1 || l) appendLine(l);
-          });
-        }
-
-        // Check for sentinel at start of remaining buf
-        if (outputBuf.startsWith('PWD:')) {
-          const end = outputBuf.indexOf('\x00');
-          if (end !== -1) {
-            const pwd = outputBuf.slice(4, end);
-            outputBuf = outputBuf.slice(end + 1);
-            updatePrompt(pwd);
-            enableInput();
-          }
-        } else if (outputBuf.startsWith('EXIT')) {
-          doLogout();
-        }
-      }
-    }
-  }));
-}
-
-async function sendToShell(cmd) {
-  await shellWriter.write(cmd + '\n');
-}
-
-// ── prompt display ─────────────────────────────────────────────────────────
-function updatePrompt(absPwd) {
-  // Determine home path from first PWD we received
-  if (!window._wcHome) window._wcHome = absPwd; // first call is always from cd $HOME
-  const home = window._wcHome;
-  if (absPwd === home) displayCwd = '~';
-  else if (absPwd.startsWith(home + '/')) displayCwd = '~/' + absPwd.slice(home.length + 1);
-  else displayCwd = absPwd;
-  promptLabel.textContent = `${username}@linux-lab:${displayCwd}$ `;
-  statusLeft.textContent = 'cwd: ' + displayCwd;
-}
-
-function enableInput() {
-  cmdInput.disabled = false;
-  cmdInput.focus();
-  statusRight.textContent = '';
-}
-
-function disableInput() {
-  cmdInput.disabled = true;
-  statusRight.textContent = 'running...';
-}
-
-// ── run command ────────────────────────────────────────────────────────────
-async function runCommand(raw) {
-  const cmd = raw.trim();
-  if (!cmd) { await sendToShell(''); return; }
-
-  appendLine(promptLabel.textContent + cmd, 'line-prompt');
-  cmdHistory.unshift(cmd);
-  histIdx = -1;
-
-  if (cmd === 'clear') { clearOutput(); enableInput(); return; }
-  if (cmd === 'whoami') { appendLine(username); enableInput(); return; }
-  if (cmd === 'hostname') { appendLine('linux-lab'); enableInput(); return; }
-  if (cmd === 'save-session') {
-    const s = await saveSession();
-    exportSession(s);
-    appendLine('Session saved and downloaded.', 'line-info');
-    enableInput(); return;
+  if (check && check.code === 0) {
+    // Great — h works as cwd
+    homeDir = h;
+  } else {
+    // Fallback: use WC root + subdir
+    const fallback = root + '/home/' + user;
+    await wc.fs.mkdir(root + '/home', { recursive: true }).catch(() => {});
+    await wc.fs.mkdir(fallback, { recursive: true }).catch(() => {});
+    await wc.fs.mkdir(fallback + '/examples', { recursive: true }).catch(() => {});
+    homeDir = fallback;
   }
 
-  disableInput();
-  await sendToShell(cmd);
-  // input re-enabled when PWD sentinel comes back
+  // Write starter files
+  const write = (p, c) => wc.fs.writeFile(homeDir + p, c).catch(() => {});
+  await write('/readme.txt',
+`Welcome to Linux Lab, ${user}!
+
+Files here persist when you save your session.
+Try: ls, pwd, mkdir, touch, cat, echo, sh script.sh, node script.js
+`);
+  await write('/examples/hello.sh', `#!/bin/sh\necho "Hello, ${user}!"\n`);
+  await write('/examples/loop.sh',  `#!/bin/sh\nfor i in 1 2 3 4 5; do\n  echo "Line $i"\ndone\n`);
+  await write('/examples/greet.js', `const n = process.argv[2] || '${user}';\nconsole.log('Hello, ' + n + '!');\n`);
+
+  return homeDir;
 }
 
 // ── session helpers ────────────────────────────────────────────────────────
@@ -273,137 +258,174 @@ async function collectFiles(path) {
     for (const e of await wc.fs.readdir(path, { withFileTypes: true })) {
       const full = path + '/' + e.name;
       res[e.name] = e.isDirectory()
-        ? { type:'dir', children: await collectFiles(full) }
-        : { type:'file', content: await wc.fs.readFile(full,'utf-8').catch(()=>'') };
+        ? { type: 'dir', children: await collectFiles(full) }
+        : { type: 'file', content: await wc.fs.readFile(full, 'utf-8').catch(() => '') };
     }
   } catch {}
   return res;
 }
 
 async function restoreFiles(base, files) {
-  for (const [name, node] of Object.entries(files)) {
-    const p = base + '/' + name;
+  for (const [n, node] of Object.entries(files)) {
+    const p = base + '/' + n;
     if (node.type === 'dir') {
-      await wc.fs.mkdir(p, { recursive:true }).catch(()=>{});
+      await wc.fs.mkdir(p, { recursive: true }).catch(() => {});
       await restoreFiles(p, node.children || {});
     } else {
-      await wc.fs.writeFile(p, node.content || '').catch(()=>{});
+      await wc.fs.writeFile(p, node.content || '').catch(() => {});
     }
   }
 }
 
-async function saveSession() {
-  const home = window._wcHome || '';
-  const files = await collectFiles(home);
-  const s = { user: username, timestamp: Date.now(), cwd: displayCwd, files };
-  localStorage.setItem(STORAGE_KEY(username), JSON.stringify(s));
+async function doSave() {
+  const files = await collectFiles(homeDir);
+  const s = { user: username, timestamp: Date.now(), cwd: shellCwd, files };
+  localStorage.setItem(SKEY(username), JSON.stringify(s));
   return s;
 }
 
-function loadSession(u) {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY(u))); } catch { return null; }
+function loadSaved(u) {
+  try { return JSON.parse(localStorage.getItem(SKEY(u))); } catch { return null; }
 }
 
-function exportSession(s) {
+function exportJSON(s) {
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([JSON.stringify(s,null,2)], {type:'application/json'}));
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }));
   a.download = `linuxlab-${s.user}-${new Date(s.timestamp).toISOString().slice(0,10)}.json`;
   a.click();
 }
 
-// ── start / logout session ─────────────────────────────────────────────────
-async function startSession(user, session = null) {
-  username = user;
-  window._wcHome = null; // reset, will be set on first PWD sentinel
-
-  loginScreen.style.display = 'none';
-  termScreen.style.display = 'flex';
+// ── enable / disable input ─────────────────────────────────────────────────
+function enable() {
+  busy = false;
+  cmdInput.disabled = false;
+  cmdInput.focus();
+  statusRight.textContent = '';
+}
+function disable() {
+  busy = true;
   cmdInput.disabled = true;
-  document.getElementById('title-label').textContent = user + '@linux-lab — sh';
+  statusRight.textContent = 'running…';
+}
 
-  // Create user home via fs API (we know nothing about the path yet)
-  // Use a predictable relative path from WC root
-  const tempProc = await wc.spawn('sh', ['-c', 'mkdir -p ~/userdata/' + user + '/examples && echo OK']);
-  let tempOut = '';
-  await tempProc.output.pipeTo(new WritableStream({ write(c){tempOut+=c;} }));
-  await tempProc.exit;
+// ── run command ────────────────────────────────────────────────────────────
+async function runCommand(raw) {
+  const cmd = raw.trim();
+  if (!cmd) return;
 
-  // Get the real home path
-  const pwdProc = await wc.spawn('sh', ['-c', 'echo $HOME']);
-  let realHome = '';
-  await pwdProc.output.pipeTo(new WritableStream({ write(c){realHome+=c;} }));
-  await pwdProc.exit;
-  realHome = realHome.trim();
+  print(promptLabel.textContent + cmd, 'line-prompt');
+  cmdHistory.unshift(cmd);
+  histIdx = -1;
 
-  const userHome = realHome + '/userdata/' + user;
-
-  // Write starter files if fresh
-  await wc.fs.writeFile(userHome + '/readme.txt',
-`Welcome to Linux Lab, ${user}!\n\nFiles here persist when you save your session.\nTry: ls, pwd, mkdir, touch, cat, echo, sh, node\n`
-  ).catch(()=>{});
-  await wc.fs.writeFile(userHome + '/examples/hello.sh', `#!/bin/sh\necho "Hello, ${user}!"\n`).catch(()=>{});
-  await wc.fs.writeFile(userHome + '/examples/loop.sh',  `#!/bin/sh\nfor i in 1 2 3 4 5; do\n  echo "Line $i"\ndone\n`).catch(()=>{});
-  await wc.fs.writeFile(userHome + '/examples/greet.js', `const n=process.argv[2]||'${user}';\nconsole.log('Hello from Node, '+n+'!');\n`).catch(()=>{});
-
-  if (session?.files) {
-    appendLine(`Restoring session from ${new Date(session.timestamp).toLocaleString()}...`, 'line-info');
-    await restoreFiles(userHome, session.files);
+  // ── built-ins ──────────────────────────────────────────────────────────
+  if (cmd === 'clear')   { clearOutput(); return; }
+  if (cmd === 'whoami')  { print(username); return; }
+  if (cmd === 'hostname'){ print('linux-lab'); return; }
+  if (cmd === 'exit' || cmd === 'logout') { doLogout(); return; }
+  if (cmd === 'save-session') {
+    const s = await doSave(); exportJSON(s);
+    print('Session saved and downloaded.', 'line-info'); return;
   }
 
-  appendLine(`Welcome to Linux Lab, ${user}! Type commands below.`, 'line-info');
-  appendLine(`Tip: type 'save-session' or click 💾 to save your work.`, 'line-info');
-  appendLine('', 'line-out');
+  // ── cd ─────────────────────────────────────────────────────────────────
+  const cdM = cmd.match(/^cd(\s+(.+))?$/);
+  if (cdM) {
+    const target = resolveCd((cdM[2] || '').trim());
+    // verify by spawning pwd inside that dir
+    const chk = await spawnCapture(['sh', '-c', 'pwd'], target).catch(() => null);
+    if (chk && chk.code === 0) {
+      setPrompt(target);
+    } else {
+      print(`cd: ${cdM[2] || '~'}: No such file or directory`, 'line-err');
+    }
+    return;
+  }
 
-  await startShell(userHome);
+  // ── all other commands ─────────────────────────────────────────────────
+  disable();
+  try {
+    const code = await spawnStream(cmd, shellCwd);
+    if (code !== 0) statusRight.textContent = `exit ${code}`;
+  } catch(e) {
+    print('Error: ' + e.message, 'line-err');
+  }
+  enable();
+}
+
+// ── start session ──────────────────────────────────────────────────────────
+async function startSession(user, saved = null) {
+  username = user;
+  loginScreen.style.display = 'none';
+  termScreen.style.display = 'flex';
+  $('title-label').textContent = user + '@linux-lab';
+  disable();
+
+  print('Setting up your environment…', 'line-info');
+  await setupHome(user);
+
+  if (saved?.files) {
+    print(`Restoring session from ${new Date(saved.timestamp).toLocaleString()}…`, 'line-info');
+    await restoreFiles(homeDir, saved.files);
+    // restore cwd if valid
+    const chk = await spawnCapture(['sh','-c','pwd'], saved.cwd).catch(()=>null);
+    shellCwd = (chk && chk.code === 0) ? saved.cwd : homeDir;
+  } else {
+    shellCwd = homeDir;
+  }
+
+  setPrompt(shellCwd);
+  clearOutput();
+  print(`Welcome to Linux Lab, ${user}!`, 'line-info');
+  print(`Type commands below. 'save-session' or 💾 to save.`, 'line-info');
+  print('', 'line-out');
+  enable();
 }
 
 function doLogout() {
   username = '';
-  window._wcHome = null;
-  if (shellWriter) { shellWriter.close().catch(()=>{}); shellWriter = null; }
   clearOutput();
   termScreen.style.display = 'none';
   loginScreen.style.display = 'flex';
-  document.getElementById('restore-banner').style.display = 'none';
-  document.getElementById('uname').value = '';
-  document.getElementById('uname').focus();
+  $('restore-banner').style.display = 'none';
+  $('uname').value = '';
+  $('uname').focus();
 }
 
 // ── login events ───────────────────────────────────────────────────────────
-function cleanName(s) { return s.trim().toLowerCase().replace(/[^a-z0-9_]/g,''); }
-function getUser()    { return cleanName(document.getElementById('uname').value); }
+function cleanUser(s) { return s.trim().toLowerCase().replace(/[^a-z0-9_]/g, ''); }
+function getUser()    { return cleanUser($('uname').value); }
 
-document.getElementById('uname').addEventListener('input', () => {
-  const u = getUser(), s = u ? loadSession(u) : null;
-  const banner = document.getElementById('restore-banner');
+$('uname').addEventListener('input', () => {
+  const u = getUser(), s = u ? loadSaved(u) : null;
   if (s) {
-    document.getElementById('restore-msg').innerHTML = `Found session for <span>${u}</span> — ${new Date(s.timestamp).toLocaleString()}`;
-    banner.style.display = 'block';
-  } else { banner.style.display = 'none'; }
+    $('restore-msg').innerHTML = `Found session for <span>${u}</span> — ${new Date(s.timestamp).toLocaleString()}`;
+    $('restore-banner').style.display = 'block';
+  } else {
+    $('restore-banner').style.display = 'none';
+  }
 });
-
-document.getElementById('login-btn').addEventListener('click', () => { const u=getUser(); if(u) startSession(u,null); });
-document.getElementById('uname').addEventListener('keydown', e => { if(e.key==='Enter'){const u=getUser();if(u)startSession(u,null);} });
-document.getElementById('restore-yes').addEventListener('click', () => { const u=getUser(); if(u) startSession(u,loadSession(u)); });
-document.getElementById('restore-no').addEventListener('click',  () => { const u=getUser(); if(u) startSession(u,null); });
-document.getElementById('restore-import').addEventListener('click', () => document.getElementById('import-file').click());
-document.getElementById('import-file').addEventListener('change', async () => {
-  const file = document.getElementById('import-file').files[0]; if(!file) return;
-  try { const s=JSON.parse(await file.text()); if(!s.user) throw 0; document.getElementById('uname').value=s.user; startSession(s.user,s); }
+$('login-btn').addEventListener('click', () => { const u=getUser(); if(u) startSession(u); });
+$('uname').addEventListener('keydown', e => { if(e.key==='Enter'){const u=getUser();if(u)startSession(u);} });
+$('restore-yes').addEventListener('click', () => { const u=getUser(); if(u) startSession(u, loadSaved(u)); });
+$('restore-no').addEventListener('click',  () => { const u=getUser(); if(u) startSession(u); });
+$('restore-import').addEventListener('click', () => $('import-file').click());
+$('import-file').addEventListener('change', async () => {
+  const f = $('import-file').files[0]; if(!f) return;
+  try { const s=JSON.parse(await f.text()); if(!s.user) throw 0; $('uname').value=s.user; startSession(s.user,s); }
   catch { alert('Invalid session file.'); }
-  document.getElementById('import-file').value='';
+  $('import-file').value = '';
 });
 
 // ── terminal events ────────────────────────────────────────────────────────
-document.getElementById('save-btn').addEventListener('click', async () => {
+$('save-btn').addEventListener('click', async () => {
   if(!username) return;
-  exportSession(await saveSession());
-  appendLine('Session saved and downloaded.', 'line-info');
+  exportJSON(await doSave());
+  print('Session saved and downloaded.', 'line-info');
 });
-document.getElementById('logout-btn').addEventListener('click', doLogout);
+$('logout-btn').addEventListener('click', doLogout);
 
 cmdInput.addEventListener('keydown', async e => {
-  if (e.key === 'Enter') {
+  if (e.key === 'Enter' && !busy) {
     const cmd = cmdInput.value; cmdInput.value = '';
     await runCommand(cmd);
   } else if (e.key === 'ArrowUp') {
@@ -414,10 +436,6 @@ cmdInput.addEventListener('keydown', async e => {
     const i = Math.max(histIdx-1,-1); histIdx=i; cmdInput.value=i===-1?'':cmdHistory[i];
   } else if (e.ctrlKey && e.key==='l') {
     e.preventDefault(); clearOutput();
-  } else if (e.ctrlKey && e.key==='c') {
-    appendLine('^C', 'line-err');
-    await sendToShell(''); // send empty to get prompt back
-    enableInput();
   }
 });
 
