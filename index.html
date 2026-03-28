@@ -252,35 +252,38 @@ async function bootWebContainer() {
 
 // ─── File system helpers ──────────────────────────────────────────────────────
 const BASE_FS = (user) => ({
-  home: {
+  'readme.txt': {
+    file: { contents: `Welcome to Linux Lab, ${user}!\n\nThis is your personal practice environment.\nYour files are saved here between sessions.\n\nTry: ls, pwd, mkdir, cat, bash scripts and more!\n` }
+  },
+  'examples': {
     directory: {
-      [user]: {
-        directory: {
-          'readme.txt': {
-            file: { contents: `Welcome to Linux Lab, ${user}!\n\nThis is your personal practice environment.\nYour files are saved here between sessions.\n\nTry: ls, pwd, mkdir, nano, bash scripts and more!\n` }
-          },
-          'examples': {
-            directory: {
-              'hello.sh': { file: { contents: `#!/bin/bash\necho "Hello, ${user}!"\necho "Today is: $(date)"\n` } },
-              'loop.sh':  { file: { contents: `#!/bin/bash\nfor i in {1..5}; do\n  echo "Line $i"\ndone\n` } },
-              'args.sh':  { file: { contents: `#!/bin/bash\necho "You passed $# arguments"\nfor arg in "$@"; do\n  echo "  -> $arg"\ndone\n` } },
-              'greet.py': { file: { contents: `import sys\nname = sys.argv[1] if len(sys.argv) > 1 else "${user}"\nprint(f"Hello from Python, {name}!")\n` } },
-            }
-          }
-        }
-      }
+      'hello.sh': { file: { contents: `#!/bin/sh\necho "Hello, ${user}!"\n` } },
+      'loop.sh':  { file: { contents: `#!/bin/sh\nfor i in 1 2 3 4 5; do\n  echo "Line $i"\ndone\n` } },
+      'args.sh':  { file: { contents: `#!/bin/sh\necho "You passed $# arguments"\nfor arg in "$@"; do\n  echo "  -> $arg"\ndone\n` } },
+      'greet.js': { file: { contents: `const name = process.argv[2] || '${user}';\nconsole.log('Hello from Node.js, ' + name + '!');\n` } },
     }
   }
 });
 
+const HOME = (user) => `/home/${user}`;
+
 async function mountBaseFS(user) {
-  await wc.mount(BASE_FS(user));
+  // Create home directory structure explicitly
+  await wc.fs.mkdir(`/home`, { recursive: true });
+  await wc.fs.mkdir(`/home/${user}`, { recursive: true });
+  await wc.fs.mkdir(`/home/${user}/examples`, { recursive: true });
+  const fs = BASE_FS(user);
+  await wc.fs.writeFile(`/home/${user}/readme.txt`, fs['readme.txt'].file.contents);
+  const ex = fs['examples'].directory;
+  for (const [name, node] of Object.entries(ex)) {
+    await wc.fs.writeFile(`/home/${user}/examples/${name}`, node.file.contents);
+  }
 }
 
 // ─── Session persistence ──────────────────────────────────────────────────────
 async function saveSession(user) {
-  const files = await collectFiles(wc, `/home/${user}`);
-  const session = { user, timestamp: Date.now(), files, cwd: currentCwd() };
+  const files = await collectFiles(wc, HOME(user));
+  const session = { user, timestamp: Date.now(), files, cwd: shellCwd };
   localStorage.setItem(STORAGE_PREFIX + user, JSON.stringify(session));
   return session;
 }
@@ -365,6 +368,9 @@ function updatePrompt(cwd) {
 }
 
 // ─── Shell execution ──────────────────────────────────────────────────────────
+// Shell state: track cwd in JS since WebContainer's jsh doesn't persist it
+let shellCwd = '/';
+
 async function runCommand(cmd) {
   const trimmed = cmd.trim();
   if (!trimmed) return;
@@ -374,13 +380,8 @@ async function runCommand(cmd) {
   histIdx = -1;
   statusRight.textContent = 'running...';
 
-  // Built-in: clear
   if (trimmed === 'clear') { clearOutput(); statusRight.textContent = ''; return; }
-
-  // Built-in: logout/exit
   if (trimmed === 'exit' || trimmed === 'logout') { doLogout(); return; }
-
-  // Built-in: save
   if (trimmed === 'save-session') {
     const s = await saveSession(username);
     exportSession(s);
@@ -389,16 +390,43 @@ async function runCommand(cmd) {
     return;
   }
 
+  // Handle cd separately since jsh won't persist directory changes across spawns
+  const cdMatch = trimmed.match(/^cd\s*(.*)?$/);
+  if (cdMatch) {
+    let target = (cdMatch[1] || '').trim() || HOME(username);
+    if (target === '~') target = HOME(username);
+    else if (target.startsWith('~/')) target = HOME(username) + '/' + target.slice(2);
+    else if (!target.startsWith('/')) target = shellCwd + '/' + target;
+    // Normalize path (resolve .. and .)
+    const parts = target.split('/').filter(Boolean);
+    const resolved = [];
+    for (const p of parts) {
+      if (p === '..') resolved.pop();
+      else if (p !== '.') resolved.push(p);
+    }
+    const newPath = '/' + resolved.join('/');
+    try {
+      await wc.fs.readdir(newPath);
+      shellCwd = newPath;
+      updatePrompt(shellCwd);
+    } catch {
+      appendLine(`cd: ${cdMatch[1]}: No such file or directory`, 'line-err');
+    }
+    statusRight.textContent = '';
+    cmdInput.focus();
+    return;
+  }
+
   try {
-    const cwd = currentCwd();
-    const proc = await wc.spawn('bash', ['-c', trimmed], { cwd });
+    // Wrap command so it runs in the correct cwd
+    const wrapped = `cd "${shellCwd}" 2>/dev/null; ${trimmed}`;
+    const proc = await wc.spawn('sh', ['-c', wrapped]);
     currentProcess = proc;
 
     let outBuf = '';
     proc.output.pipeTo(new WritableStream({
       write(chunk) {
         outBuf += chunk;
-        // Stream line by line
         const lines = outBuf.split('\n');
         outBuf = lines.pop();
         for (const l of lines) appendLine(l);
@@ -408,14 +436,6 @@ async function runCommand(cmd) {
 
     const exit = await proc.exit;
     if (outBuf) appendLine(outBuf);
-
-    // Update cwd after every command
-    const pwdProc = await wc.spawn('bash', ['-c', 'pwd'], { cwd });
-    let newCwd = '';
-    await pwdProc.output.pipeTo(new WritableStream({ write(c) { newCwd += c; } }));
-    await pwdProc.exit;
-    if (newCwd.trim()) updatePrompt(newCwd.trim());
-
     if (exit !== 0) statusRight.textContent = `exit: ${exit}`;
     else statusRight.textContent = '';
 
@@ -443,16 +463,18 @@ async function startSession(user, session = null) {
   document.getElementById('title-label').textContent = `${user}@linux-lab — bash`;
 
   await mountBaseFS(user);
+  shellCwd = HOME(user);
 
   if (session) {
     appendLine(`Restoring session from ${new Date(session.timestamp).toLocaleString()}...`, 'line-info');
-    await restoreFiles(wc, `/home/${user}`, session.files || {});
-    updatePrompt(session.cwd || `/home/${user}`);
+    await restoreFiles(wc, HOME(user), session.files || {});
+    shellCwd = session.cwd || HOME(user);
+    updatePrompt(shellCwd);
     appendLine('Session restored. Welcome back!', 'line-info');
   } else {
-    updatePrompt(`/home/${user}`);
+    updatePrompt(HOME(user));
     appendLine(`Welcome to Linux Lab, ${user}!`, 'line-info');
-    appendLine(`Ubuntu 22.04 (WebContainer) — type commands below.`, 'line-info');
+    appendLine(`WebContainer shell — type commands below.`, 'line-info');
     appendLine(`Tip: type 'save-session' or click 💾 to save your work.`, 'line-info');
   }
 
